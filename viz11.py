@@ -1,429 +1,677 @@
 """
-BKK_Hospital_Default.py
+spatial_map_v22_no_search_dropdown_with_types.py
 
-Updated script:
-- Combined districts layer (fill + bounds) with fillColor #3388ff (opacity 0.2) and stroke color #2c3e50.
-- Hospital popups restored to show textual details (name, เขต, เบอร์, เว็บไซต์) — not icon-only.
-- TileLayer names changed to Thai: 'แผนที่แบบหยาบ' and 'แผนที่แบบละเอียด'.
-- LayerControl font set to Bai Jamjuree, 16px.
-- Injected small JS to make district tooltips open/close on touch (for mobile devices).
-- GeoJsonTooltip still bound for desktop hover; JS makes touch work by toggling tooltips on tap.
+Version: v22 with added hospital-type filters.
+
+What this file does (changes since v22 base):
+- Adds a color-by-type layer "Hospitals (colored by type)" where markers are colored:
+    - 'รัฐ'  -> light green (#66bb6a)
+    - 'เอกชน' -> pink (#ff80b3)
+    - unknown/other -> gray (#9E9E9E)
+  This layer groups all hospitals and colors each marker by its 'ประเภท' column.
+- Adds a filter "Hospitals - รัฐ" (show only public/state hospitals) (show=False).
+- Adds a filter "Hospitals - เอกชน" (show only private hospitals) (show=False).
+- Each of the two per-type filters shows markers like the Hospitals Only layer,
+  but restricted to that hospital type and includes the same popup structure.
+- Keeps all original layers and behaviors (heat, size, choropleth, bounds, click-highlight).
+- Defensive: if column "ประเภท" is missing, all hospitals are treated as 'unknown' and colored gray.
 
 Usage:
-    python BKK_Hospital_Default.py
+    python spatial_map_v22_no_search_dropdown_with_types.py
+
+Place required inputs in same folder:
+  - hospitals.csv
+  - communities.csv
+  - districts_bangkok.geojson
 
 Output:
-    BKK_Hospital_Default.html
+  - spatial_map_v22_no_search_dropdown.html
 """
 import json
-import base64
-from pathlib import Path
-import html
 import math
 import pandas as pd
 import folium
+from folium.plugins import HeatMap
 from folium.features import GeoJsonTooltip, GeoJsonPopup
-from folium import FeatureGroup
-from shapely.geometry import shape, Point
 from geopy.distance import geodesic
+from shapely.geometry import shape, Point
+import branca.colormap as cm
 
 # -------------------------
-# Config / paths
+# Config / Data load
 # -------------------------
 HOSPITALS_CSV = "hospitals.csv"
 COMMUNITIES_CSV = "communities.csv"
-DISTRICTS_CSV = "districts.csv"   # optional
 GEOJSON_PATH = "districts_bangkok.geojson"
-OUT_HTML = "BKK_Hospital_Default.html"
+OUT_HTML = "spatial_map_v22_no_search_dropdown.html"
 
-HOSP_ICON_FN = "Hospital.png"
-PUSH_PIN_FN = "RoundPushpin.png"
-
-# -------------------------
-# Helper: inline image -> data URI if available
-# -------------------------
-def try_inline_image(path):
-    p = Path(path)
-    if p.exists():
-        b = p.read_bytes()
-        ext = p.suffix.lower()
-        mime = "image/png"
-        if ext in (".jpg", ".jpeg"):
-            mime = "image/jpeg"
-        elif ext == ".svg":
-            mime = "image/svg+xml"
-        return "data:{};base64,{}".format(mime, base64.b64encode(b).decode("ascii"))
-    return path
-
-HOSP_ICON_URI = try_inline_image(HOSP_ICON_FN)
-PUSH_PIN_URI = try_inline_image(PUSH_PIN_FN)
-
-# -------------------------
-# Load CSVs and geojson
-# -------------------------
+# Load CSVs
 hospitals = pd.read_csv(HOSPITALS_CSV)
 communities = pd.read_csv(COMMUNITIES_CSV)
-with open(GEOJSON_PATH, "r", encoding="utf-8") as f:
-    bangkok_geo = json.load(f)
 
-# -------------------------
-# Detect columns, sanitize
-# -------------------------
-hospitals.columns = hospitals.columns.str.strip()
-communities.columns = communities.columns.str.strip()
-
+# Basic expected coordinate column names (adjust if your CSV uses different headers)
 lat_col = 'ละติจูด'
 lon_col = 'ลองจิจูด'
 if lat_col not in hospitals.columns or lon_col not in hospitals.columns:
-    raise KeyError("Expected hospital coords columns '{}' and '{}' in {}".format(lat_col, lon_col, HOSPITALS_CSV))
+    raise KeyError(f"Expected hospital coords columns '{lat_col}', '{lon_col}' in {HOSPITALS_CSV}")
 if lat_col not in communities.columns or lon_col not in communities.columns:
-    raise KeyError("Expected community coords columns '{}' and '{}' in {}".format(lat_col, lon_col, COMMUNITIES_CSV))
+    raise KeyError(f"Expected community coords columns '{lat_col}', '{lon_col}' in {COMMUNITIES_CSV}")
 
+# Clean column names (strip whitespace / BOM)
+hospitals.columns = hospitals.columns.str.strip()
+communities.columns = communities.columns.str.strip()
+
+# Try to detect the hospital name and community name column names robustly
 possible_hosp_name_cols = ['โรงพยาบาล', 'โรงพาบาล', 'ชื่อโรงพยาบาล', 'hospital', 'name', 'ชื่อ']
-hosp_name_col = next((c for c in possible_hosp_name_cols if c in hospitals.columns), hospitals.columns[0])
+possible_comm_name_cols = ['ชุมชน', 'ชื่อชุมชน', 'community', 'name', 'ชื่อ']
+
+hosp_name_col = None
+for c in possible_hosp_name_cols:
+    if c in hospitals.columns:
+        hosp_name_col = c
+        break
+if hosp_name_col is None:
+    hosp_name_col = hospitals.columns[0]
+    print(f"Warning: hospital name column not found among expected names, using '{hosp_name_col}' as fallback")
+
+comm_name_col = None
+for c in possible_comm_name_cols:
+    if c in communities.columns:
+        comm_name_col = c
+        break
+if comm_name_col is None:
+    comm_name_col = communities.columns[0]
+    print(f"Warning: community name column not found among expected names, using '{comm_name_col}' as fallback")
+
+# Optionally trim values in the detected name columns (if they exist)
+try:
+    hospitals[hosp_name_col] = hospitals[hosp_name_col].astype(str).str.strip()
+except Exception:
+    pass
+try:
+    communities[comm_name_col] = communities[comm_name_col].astype(str).str.strip()
+except Exception:
+    pass
 
 # -------------------------
-# Optional: load districts.csv and map values into a dict
+# Create map (CartoDB Positron)
 # -------------------------
-district_click_map = {}
-if Path(DISTRICTS_CSV).exists():
-    try:
-        districts_df = pd.read_csv(DISTRICTS_CSV)
-        districts_df.columns = districts_df.columns.str.strip()
-        cols = list(districts_df.columns)
-        name_col = next((c for c in cols if c in ['เขต', 'name', 'district', 'amp_th']), None)
-        hospcount_col = next((c for c in cols if c in ['จำนวนโรงพยาบาล', 'num_hospitals', 'hospitals']), None)
-        pop_col = next((c for c in cols if c in ['จำนวนประชากร', 'จำนวนประชาชน', 'population', 'pop']), None)
-        for _, r in districts_df.iterrows():
-            try:
-                k = str(r.get(name_col, "")).strip()
-                district_click_map[k] = {
-                    "num_hospitals_csv": r.get(hospcount_col, ""),
-                    "population_csv": r.get(pop_col, "")
-                }
-            except Exception:
-                continue
-    except Exception:
-        district_click_map = {}
+m = folium.Map(
+    location=[communities[lat_col].mean(), communities[lon_col].mean()],
+    zoom_start=12,
+    tiles=None
+)
+folium.TileLayer(
+    tiles='https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+    attr='&copy; <a href="https://carto.com/attributions">CARTO</a>',
+    name='CartoDB Positron',
+    control=True,
+    show=True
+).add_to(m)
+folium.TileLayer('OpenStreetMap', name='OpenStreetMap', show=False).add_to(m)
 
 # -------------------------
-# Compute simple district metrics and write back into geojson properties
-# (so tooltip fields exist)
+# All Hospitals baseline layer (markers + community->nearest lines)
+# NOTE: do NOT show by default
 # -------------------------
-district_features = bangkok_geo.get('features', [])
-district_name_field = 'amp_th'  # adjust if geojson uses different property name
+all_layer = folium.FeatureGroup(name="All Hospitals", show=False).add_to(m)
+for _, row in hospitals.iterrows():
+    popup_hosp = (
+        f"<div style=\"background:white; padding:8px; font-size:13px; border-radius:8px;\">"
+        f"<b>🏥 {row.get(hosp_name_col, '')}</b><br>"
+        f"สิทธิบัตรทอง: {row.get('สิทธิบัตรทอง', '')}<br>"
+        f"สิทธิประกันสังคม: {row.get('สิทธิประกันสังคม', '')}<br>"
+        f"สิทธิข้าราชการ: {row.get('สิทธิข้าราชการ', '')}"
+        f"</div>"
+    )
+    folium.CircleMarker(
+        location=[row[lat_col], row[lon_col]],
+        color='red', radius=7,
+        popup=folium.Popup(popup_hosp, max_width=300),
+        tooltip=row.get(hosp_name_col, ''),
+        fill=True, fill_opacity=0.8
+    ).add_to(all_layer)
 
-# build shapely shapes
-district_shapes = []
-for feat in district_features:
-    geom = feat.get('geometry')
-    if geom is None:
-        district_shapes.append(None)
-    else:
-        district_shapes.append(shape(geom))
+# -------------------------
+# Hospitals Only filter (shows ONLY hospital markers)
+# DEFAULT VISIBLE
+# -------------------------
+hospitals_only_layer = folium.FeatureGroup(name="Hospitals Only", show=True).add_to(m)
+for _, row in hospitals.iterrows():
+    popup_hosp = (
+        f"🏥 {row.get(hosp_name_col, '')}"
+        f"<br>สิทธิบัตรทอง: {row.get('สิทธิบัตรทอง','')}"
+        f"<br>สิทธิประกันสังคม: {row.get('สิทธิประกันสังคม','')}"
+        f"<br>สิทธิข้าราชการ: {row.get('สิทธิข้าราชการ','')}"
+    )
+    folium.CircleMarker(
+        location=[row[lat_col], row[lon_col]],
+        radius=7,
+        color='#d32f2f',
+        fill=True, fill_color='#d32f2f', fill_opacity=0.9,
+        popup=folium.Popup(popup_hosp, max_width=280),
+        tooltip=row.get(hosp_name_col, '')
+    ).add_to(hospitals_only_layer)
 
-# initialize metrics
-district_metrics = {}
-for feat in district_features:
-    name = feat.get('properties', {}).get(district_name_field)
-    district_metrics[name] = {'num_hospitals': 0, 'num_communities': 0, 'sum_hospital_weights': 0}
+# -------------------------
+# Hospitals-only marker layers per right (as before)
+# -------------------------
+rights = {"สิทธิบัตรทอง": "orange", "สิทธิประกันสังคม": "green", "สิทธิข้าราชการ": "purple"}
+for right, color in rights.items():
+    layer = folium.FeatureGroup(name=f"Hospitals - {right}", show=False).add_to(m)
+    eligible = hospitals[hospitals[right] == "YES"] if right in hospitals.columns else hospitals.iloc[0:0]
+    for _, row in eligible.iterrows():
+        folium.CircleMarker(
+            location=[row[lat_col], row[lon_col]],
+            radius=7,
+            color=color,
+            fill=True, fill_color=color, fill_opacity=0.9,
+            popup=folium.Popup(f"🏥 {row.get(hosp_name_col,'')}<br>รับสิทธิ: {right}", max_width=300),
+            tooltip=f"{row.get(hosp_name_col,'')} — {right}"
+        ).add_to(layer)
 
-# nearest assignment (communities -> nearest hospital)
-comm_assigned = []
+# -------------------------
+# Communities baseline + compute nearest-assignment (nearest hospital index per community)
+# -------------------------
+comm_assigned = []  # (comm_idx, nearest_hosp_idx, distance_m)
 for c_idx, comm in communities.iterrows():
-    try:
-        comm_lat = float(comm[lat_col])
-        comm_lon = float(comm[lon_col])
-    except Exception:
-        comm_assigned.append((c_idx, None, None))
-        continue
     min_dist = float('inf')
     nearest_idx = None
     for h_idx, hosp in hospitals.iterrows():
-        try:
-            h_lat = float(hosp[lat_col])
-            h_lon = float(hosp[lon_col])
-        except Exception:
-            continue
-        d = geodesic((comm_lat, comm_lon), (h_lat, h_lon)).meters
+        d = geodesic((comm[lat_col], comm[lon_col]), (hosp[lat_col], hosp[lon_col])).meters
         if d < min_dist:
             min_dist = d
             nearest_idx = h_idx
-    comm_assigned.append((c_idx, nearest_idx, min_dist if min_dist != float('inf') else None))
+    comm_assigned.append((c_idx, nearest_idx, min_dist))
 
-# hospital weight (how many communities assigned)
+# Draw baseline lines (communities -> nearest hospital) and community markers on all_layer
+for c_idx, h_idx, dist in comm_assigned:
+    comm = communities.loc[c_idx]
+    hosp = hospitals.loc[h_idx]
+    hosp_name = hosp.get(hosp_name_col, '')
+    comm_name = comm.get(comm_name_col, '')
+    popup_html = (
+        f"<b>ชุมชน:</b> {comm_name}"
+        f"<br><b>โรงพยาบาลใกล้ที่สุด:</b> {hosp_name}"
+        f"<br><b>ระยะ:</b> {dist:.0f} m"
+    )
+    folium.PolyLine(
+        locations=[[comm[lat_col], comm[lon_col]], [hosp[lat_col], hosp[lon_col]]],
+        color='gray', weight=1.5, opacity=0.5
+    ).add_to(all_layer)
+    folium.CircleMarker(
+        location=[comm[lat_col], comm[lon_col]],
+        color='blue', radius=4.5,
+        popup=folium.Popup(popup_html, max_width=320),
+        tooltip=comm_name,
+        fill=True, fill_opacity=0.8
+    ).add_to(all_layer)
+
+# Communities standalone layer (toggleable)
+community_layer = folium.FeatureGroup(name="Communities", show=False).add_to(m)
+for _, row in communities.iterrows():
+    folium.CircleMarker(
+        location=[row[lat_col], row[lon_col]],
+        color='blue', radius=4,
+        popup=folium.Popup(f"ชุมชน: {row.get(comm_name_col,'')}", max_width=280),
+        tooltip=row.get(comm_name_col, ''),
+        fill=True, fill_opacity=0.7
+    ).add_to(community_layer)
+
+# -------------------------
+# NEW: Connections layers (one per right) that include:
+#  - polylines from each community to nearest eligible hospital for that right
+#  - community markers (blue) and eligible hospital markers (colored) inside the same layer
+# -------------------------
+for right, color in rights.items():
+    conn_layer = folium.FeatureGroup(name=f"Connections - {right}", show=False).add_to(m)
+    eligible = hospitals[hospitals[right] == "YES"] if right in hospitals.columns else hospitals.iloc[0:0]
+    if eligible.empty:
+        continue
+
+    added_hospital_idxs = set()
+
+    for c_idx, comm in communities.iterrows():
+        min_dist = float('inf')
+        nearest_idx = None
+        for h_idx, hosp in eligible.iterrows():
+            d = geodesic((comm[lat_col], comm[lon_col]), (hosp[lat_col], hosp[lon_col])).meters
+            if d < min_dist:
+                min_dist = d
+                nearest_idx = hosp.name
+        if nearest_idx is None:
+            continue
+        hosp_row = hospitals.loc[nearest_idx]
+        comm_name = comm.get(comm_name_col, '')
+        folium.PolyLine(
+            locations=[[comm[lat_col], comm[lon_col]], [hosp_row[lat_col], hosp_row[lon_col]]],
+            color=color, weight=2, opacity=0.7
+        ).add_to(conn_layer)
+        folium.CircleMarker(
+            location=[comm[lat_col], comm[lon_col]],
+            radius=4.5,
+            color='blue', fill=True, fill_color='blue', fill_opacity=0.8,
+            popup=folium.Popup(f"ชุมชน: {comm_name}<br>เชื่อมกับ ({right}): {hosp_row.get(hosp_name_col,'')}", max_width=300),
+            tooltip=comm_name
+        ).add_to(conn_layer)
+        if nearest_idx not in added_hospital_idxs:
+            added_hospital_idxs.add(nearest_idx)
+            folium.CircleMarker(
+                location=[hosp_row[lat_col], hosp_row[lon_col]],
+                radius=7,
+                color=color, fill=True, fill_color=color, fill_opacity=0.95,
+                popup=folium.Popup(f"🏥 {hosp_row.get(hosp_name_col,'')}<br>รับสิทธิ: {right}", max_width=300),
+                tooltip=f"{hosp_row.get(hosp_name_col,'')} — {right}"
+            ).add_to(conn_layer)
+
+# -------------------------
+# Compute hospital weights (nearest-assignment) for marker-size layer
+# -------------------------
 hospitals = hospitals.copy()
 hospitals['weight'] = 0
 for c_idx, h_idx, d in comm_assigned:
-    if h_idx is not None and pd.notnull(h_idx):
-        try:
-            hospitals.at[h_idx, 'weight'] += 1
-        except Exception:
-            pass
+    hospitals.at[h_idx, 'weight'] += 1
 
-# assign hospitals to district (PIP)
-for h_idx, h in hospitals.iterrows():
-    try:
-        pt = Point(float(h[lon_col]), float(h[lat_col]))
-    except Exception:
-        continue
-    for i, poly in enumerate(district_shapes):
-        if poly is None:
-            continue
-        try:
-            if poly.contains(pt):
-                name = district_features[i].get('properties', {}).get(district_name_field)
-                if name not in district_metrics:
-                    district_metrics[name] = {'num_hospitals': 0, 'num_communities': 0, 'sum_hospital_weights': 0}
-                district_metrics[name]['num_hospitals'] += 1
-                district_metrics[name]['sum_hospital_weights'] += int(h.get('weight', 0) or 0)
-                break
-        except Exception:
-            continue
+# -------------------------
+# HeatMap featuregroup: keep HeatMap but ALSO show hospital markers in the same layer
+# NOTE: not visible by default
+# -------------------------
+heat_layer = folium.FeatureGroup(name="Hospitals Heat (by nearby communities)", show=False).add_to(m)
+heat_data = [[row[lat_col], row[lon_col], row['weight']] for _, row in hospitals.iterrows()]
+HeatMap(heat_data, radius=25, blur=15, max_zoom=12).add_to(heat_layer)
 
-# assign communities to district
-for c_idx, c in communities.iterrows():
-    try:
-        pt = Point(float(c[lon_col]), float(c[lat_col]))
-    except Exception:
-        continue
-    for i, poly in enumerate(district_shapes):
-        if poly is None:
-            continue
-        try:
-            if poly.contains(pt):
-                name = district_features[i].get('properties', {}).get(district_name_field)
-                if name not in district_metrics:
-                    district_metrics[name] = {'num_hospitals': 0, 'num_communities': 0, 'sum_hospital_weights': 0}
-                district_metrics[name]['num_communities'] += 1
-                break
-        except Exception:
-            continue
+# Add hospital markers into the heat layer (so toggling heat shows markers too)
+for _, row in hospitals.iterrows():
+    w = int(row.get('weight', 0))
+    popup_h = f"🏥 {row.get(hosp_name_col,'')}<br>จำนวนชุมชน: {w}"
+    folium.CircleMarker(
+        location=[row[lat_col], row[lon_col]],
+        radius=6,
+        color='#b71c1c',
+        fill=True, fill_color='#b71c1c', fill_opacity=0.85,
+        popup=folium.Popup(popup_h, max_width=260),
+        tooltip=f"{row.get(hosp_name_col,'')} — weight: {w}"
+    ).add_to(heat_layer)
 
-max_sum_weights = max((v['sum_hospital_weights'] for v in district_metrics.values()), default=1)
+# -------------------------
+# Hospitals marker-size layer (size ~ weight) with color intensity
+# This layer shows sized circle + a red center marker (radius=7)
+# NOTE: not visible by default
+# -------------------------
+size_layer = folium.FeatureGroup(name="Hospitals (by nearby communities) - marker size", show=False).add_to(m)
 
-# write into geojson properties
+# Helper color functions: interpolate between two hex colors
+def hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+def rgb_to_hex(rgb):
+    return '#{:02x}{:02x}{:02x}'.format(*[int(max(0, min(255, round(v)))) for v in rgb])
+
+def mix_colors(hex1, hex2, t):
+    """Linear interpolate between hex1 and hex2 by t in [0,1]."""
+    r1, g1, b1 = hex_to_rgb(hex1)
+    r2, g2, b2 = hex_to_rgb(hex2)
+    r = r1 + (r2 - r1) * t
+    g = g1 + (g2 - g1) * t
+    b = b1 + (b2 - b1) * t
+    return rgb_to_hex((r, g, b))
+
+small_color_hex = '#ffdede'  # pale red / pink
+large_color_hex = '#b71c1c'  # deep red
+
+min_radius = 6
+max_radius = 36
+max_w = hospitals['weight'].max() if len(hospitals) > 0 else 0
+
+for _, row in hospitals.iterrows():
+    w = int(row['weight'])
+    normalized = (math.sqrt(w) / math.sqrt(max_w)) if max_w > 0 else 0.0
+    radius = min_radius + normalized * (max_radius - min_radius)
+    color_hex = mix_colors(small_color_hex, large_color_hex, normalized)
+    fill_opacity = 0.35 + 0.6 * normalized
+    stroke_weight = 1 + 2 * normalized
+    popup_hosp = f"🏥 {row.get(hosp_name_col,'')}<br>จำนวนชุมชน: {w}"
+    # 1) Big sized circle (as before)
+    folium.CircleMarker(
+        location=[row[lat_col], row[lon_col]],
+        radius=radius,
+        color=color_hex,
+        fill=True, fill_color=color_hex, fill_opacity=fill_opacity,
+        weight=stroke_weight,
+        popup=folium.Popup(popup_hosp, max_width=300),
+        tooltip=f"{row.get(hosp_name_col,'')} — {w} ชุมชน"
+    ).add_to(size_layer)
+    # 2) Red center marker to indicate exact coordinate (so large radius doesn't hide location)
+    folium.CircleMarker(
+        location=[row[lat_col], row[lon_col]],
+        radius=7,
+        color='#d32f2f', fill=True, fill_color='#d32f2f', fill_opacity=1.0,
+        weight=0.6,
+        tooltip=f"{row.get(hosp_name_col,'')} (center)"
+    ).add_to(size_layer)
+
+# -------------------------
+# NEW: Hospitals (by nearby population) - marker size & color intensity
+# Uses hospitals.csv column "จำนวนประชากรใกล้เคียงที่ต้องรองรับ"
+# -------------------------
+pop_col_name = "จำนวนประชากรใกล้เคียงที่ต้องรองรับ"
+hospitals['near_pop'] = pd.to_numeric(hospitals.get(pop_col_name, 0), errors='coerce').fillna(0).astype(int)
+max_pop = hospitals['near_pop'].max() if len(hospitals) > 0 else 0
+pop_layer = folium.FeatureGroup(name="Hospitals (by nearby population) - marker size", show=False).add_to(m)
+
+for _, row in hospitals.iterrows():
+    val = int(row.get('near_pop', 0))
+    normalized = (math.sqrt(val) / math.sqrt(max_pop)) if max_pop > 0 else 0.0
+    radius = min_radius + normalized * (max_radius - min_radius)
+    color_hex = mix_colors(small_color_hex, large_color_hex, normalized)
+    fill_opacity = 0.35 + 0.6 * normalized
+    stroke_weight = 1 + 2 * normalized
+    popup_hosp = f"🏥 {row.get(hosp_name_col,'')}<br>จำนวนประชากรใกล้เคียงที่ต้องรองรับ: {val}"
+    folium.CircleMarker(
+        location=[row[lat_col], row[lon_col]],
+        radius=radius,
+        color=color_hex,
+        fill=True, fill_color=color_hex, fill_opacity=fill_opacity,
+        weight=stroke_weight,
+        popup=folium.Popup(popup_hosp, max_width=300),
+        tooltip=f"{row.get(hosp_name_col,'')} — {val} คน"
+    ).add_to(pop_layer)
+    # center marker
+    folium.CircleMarker(
+        location=[row[lat_col], row[lon_col]],
+        radius=7,
+        color='#d32f2f', fill=True, fill_color='#d32f2f', fill_opacity=1.0,
+        weight=0.6,
+        tooltip=f"{row.get(hosp_name_col,'')} (center)"
+    ).add_to(pop_layer)
+
+# -------------------------
+# NEW: Hospitals (by beds) - marker size & color intensity
+# Uses hospitals.csv column "จำนวนเตียง"
+# -------------------------
+beds_col_name = "จำนวนเตียง"
+hospitals['beds'] = pd.to_numeric(hospitals.get(beds_col_name, 0), errors='coerce').fillna(0).astype(int)
+max_beds = hospitals['beds'].max() if len(hospitals) > 0 else 0
+beds_layer = folium.FeatureGroup(name="Hospitals (by beds) - marker size", show=False).add_to(m)
+
+for _, row in hospitals.iterrows():
+    val = int(row.get('beds', 0))
+    normalized = (math.sqrt(val) / math.sqrt(max_beds)) if max_beds > 0 else 0.0
+    radius = min_radius + normalized * (max_radius - min_radius)
+    color_hex = mix_colors(small_color_hex, large_color_hex, normalized)
+    fill_opacity = 0.35 + 0.6 * normalized
+    stroke_weight = 1 + 2 * normalized
+    popup_hosp = f"🏥 {row.get(hosp_name_col,'')}<br>จำนวนเตียง: {val}"
+    folium.CircleMarker(
+        location=[row[lat_col], row[lon_col]],
+        radius=radius,
+        color=color_hex,
+        fill=True, fill_color=color_hex, fill_opacity=fill_opacity,
+        weight=stroke_weight,
+        popup=folium.Popup(popup_hosp, max_width=300),
+        tooltip=f"{row.get(hosp_name_col,'')} — {val} เตียง"
+    ).add_to(beds_layer)
+    # center marker
+    folium.CircleMarker(
+        location=[row[lat_col], row[lon_col]],
+        radius=7,
+        color='#d32f2f', fill=True, fill_color='#d32f2f', fill_opacity=1.0,
+        weight=0.6,
+        tooltip=f"{row.get(hosp_name_col,'')} (center)"
+    ).add_to(beds_layer)
+
+# -------------------------
+# NEW: Hospitals colored by type + two per-type filters
+# - color_by_type_layer: markers colored by hospitals['ประเภท']
+# - hospitals_state_layer: only 'รัฐ'
+# - hospitals_private_layer: only 'เอกชน'
+# -------------------------
+type_col = "ประเภท"
+# define colors
+TYPE_COLOR_MAP = {
+    "รัฐ": "#66bb6a",      # light green
+    "เอกชน": "#ff80b3",    # pink
+}
+UNKNOWN_TYPE_COLOR = "#9E9E9E"  # gray
+
+# make sure the column exists (add as 'unknown' if missing)
+if type_col not in hospitals.columns:
+    hospitals[type_col] = "unknown"
+else:
+    # normalize whitespace
+    hospitals[type_col] = hospitals[type_col].astype(str).str.strip()
+
+color_by_type_layer = folium.FeatureGroup(name="Hospitals (colored by type)", show=False).add_to(m)
+hospitals_state_layer = folium.FeatureGroup(name="Hospitals - รัฐ (public only)", show=False).add_to(m)
+hospitals_private_layer = folium.FeatureGroup(name="Hospitals - เอกชน (private only)", show=False).add_to(m)
+
+for _, row in hospitals.iterrows():
+    hosp_type = (row.get(type_col) or "").strip()
+    color = TYPE_COLOR_MAP.get(hosp_type, UNKNOWN_TYPE_COLOR)
+    popup_hosp = (
+        f"🏥 {row.get(hosp_name_col,'')}"
+        f"<br>ประเภท: {hosp_type}"
+        f"<br>จำนวนเตียง: {row.get('จำนวนเตียง', '')}"
+    )
+    # common marker (radius 7)
+    marker = folium.CircleMarker(
+        location=[row[lat_col], row[lon_col]],
+        radius=7,
+        color=color,
+        fill=True, fill_color=color, fill_opacity=0.95,
+        popup=folium.Popup(popup_hosp, max_width=300),
+        tooltip=f"{row.get(hosp_name_col,'')} — {hosp_type}"
+    )
+    marker.add_to(color_by_type_layer)
+
+    # add to specific type layers as needed
+    if hosp_type == "รัฐ":
+        folium.CircleMarker(
+            location=[row[lat_col], row[lon_col]],
+            radius=7,
+            color=TYPE_COLOR_MAP["รัฐ"],
+            fill=True, fill_color=TYPE_COLOR_MAP["รัฐ"], fill_opacity=0.95,
+            popup=folium.Popup(popup_hosp, max_width=300),
+            tooltip=f"{row.get(hosp_name_col,'')} — รัฐ"
+        ).add_to(hospitals_state_layer)
+    elif hosp_type == "เอกชน":
+        folium.CircleMarker(
+            location=[row[lat_col], row[lon_col]],
+            radius=7,
+            color=TYPE_COLOR_MAP["เอกชน"],
+            fill=True, fill_color=TYPE_COLOR_MAP["เอกชน"], fill_opacity=0.95,
+            popup=folium.Popup(popup_hosp, max_width=300),
+            tooltip=f"{row.get(hosp_name_col,'')} — เอกชน"
+        ).add_to(hospitals_private_layer)
+    else:
+        # unknown type: do not add to state/private specific layers
+        pass
+
+# -------------------------
+# District GeoJSON: load and compute metrics (choropleth)
+# NOTE: choropleth layer NOT visible by default per request
+# -------------------------
+with open(GEOJSON_PATH, 'r', encoding='utf-8') as f:
+    bangkok_geo = json.load(f)
+
+district_features = bangkok_geo.get('features', [])
+district_name_field = 'amp_th'  # adjust if your geojson uses a different property name
+
+district_shapes = [shape(feat['geometry']) for feat in district_features]
+
+# assign hospitals to districts (point-in-polygon)
+hospitals['district'] = None
+for h_idx, hosp in hospitals.iterrows():
+    pt = Point(hosp[lon_col], hosp[lat_col])
+    for i, feat in enumerate(district_features):
+        if district_shapes[i].contains(pt):
+            hospitals.at[h_idx, 'district'] = feat['properties'].get(district_name_field)
+            break
+
+# district metrics
+district_metrics = {}
 for feat in district_features:
-    name = feat.get('properties', {}).get(district_name_field)
+    name = feat['properties'].get(district_name_field)
+    district_metrics[name] = {'num_hospitals': 0, 'num_communities': 0, 'sum_hospital_weights': 0}
+for _, h in hospitals.iterrows():
+    d = h['district']
+    if pd.notnull(d):
+        district_metrics[d]['num_hospitals'] += 1
+        district_metrics[d]['sum_hospital_weights'] += int(h.get('weight', 0))
+for _, comm in communities.iterrows():
+    pt = Point(comm[lon_col], comm[lat_col])
+    for i, feat in enumerate(district_features):
+        if district_shapes[i].contains(pt):
+            name = feat['properties'].get(district_name_field)
+            district_metrics[name]['num_communities'] += 1
+            break
+max_sum_weights = max((v['sum_hospital_weights'] for v in district_metrics.values()), default=1)
+for feat in district_features:
+    name = feat['properties'].get(district_name_field)
     metrics = district_metrics.get(name, {'num_hospitals': 0, 'num_communities': 0, 'sum_hospital_weights': 0})
-    feat.setdefault('properties', {})
     feat['properties']['num_hospitals'] = metrics['num_hospitals']
     feat['properties']['num_communities'] = metrics['num_communities']
     feat['properties']['sum_hospital_weights'] = metrics['sum_hospital_weights']
     feat['properties']['choropleth_norm'] = (metrics['sum_hospital_weights'] / max_sum_weights) if max_sum_weights > 0 else 0.0
-    # also embed optional csv values (if present)
-    extra = district_click_map.get(name, {})
-    feat['properties']['num_hospitals_csv'] = extra.get('num_hospitals_csv', '')
-    feat['properties']['population_csv'] = extra.get('population_csv', '')
 
-# -------------------------
-# Create map
-# -------------------------
-center = [float(communities[lat_col].astype(float).mean()), float(communities[lon_col].astype(float).mean())]
-m = folium.Map(location=center, zoom_start=12, tiles=None)
+colormap = cm.LinearColormap(['#2ecc71', '#ffd54f', '#e74c3c'], vmin=0, vmax=1)
 
-# base tiles (names changed to Thai)
-folium.TileLayer(
-    tiles='https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
-    attr='&copy; <a href="https://carto.com/attributions">CARTO</a>',
-    name='แผนที่แบบหยาบ',
-    control=True,
-    show=True
-).add_to(m)
-folium.TileLayer('OpenStreetMap', name='แผนที่แบบละเอียด', show=False, control=True).add_to(m)
-
-# -------------------------
-# Districts: single GeoJson layer for both fill and stroke + tooltip
-# fill: #3388ff with opacity 0.2; stroke: #2c3e50
-# -------------------------
-def combined_district_style(feature):
+def choro_style(feature):
+    props = feature.get('properties', {}) or {}
+    numh = props.get('num_hospitals', 0)
+    # If no hospitals in district -> gray
+    if numh == 0:
+        return {
+            'fillColor': '#9E9E9E',  # gray
+            'color': '#444444',
+            'weight': 1.4,
+            'fillOpacity': 0.65,
+            'opacity': 0.8
+        }
+    norm = props.get('choropleth_norm', 0.0)
+    color = colormap(norm)
     return {
-        'fillColor': '#3388ff',
-        'color': '#2c3e50',   # stroke color as requested
-        'weight': 3,
-        'fillOpacity': 0.2,
-        'opacity': 0.95
+        'fillColor': color,
+        'color': '#444444',
+        'weight': 1.4,
+        'fillOpacity': 0.65,
+        'opacity': 0.8
     }
 
-districts_layer = FeatureGroup(name="Districts (fill + bounds)", show=True, control=False).add_to(m)
-
-# Use GeoJsonTooltip to bind tooltip on hover to the same GeoJson layer (desktop)
-tooltip_fields = [district_name_field, 'num_hospitals', 'num_communities']
-tooltip_aliases = ['เขต:', 'จำนวนโรงพยาบาล:', 'จำนวนชุมชน:']
-gj = folium.GeoJson(
+choropleth_layer = folium.FeatureGroup(name="District Choropleth (by hospital weights)", show=False).add_to(m)
+folium.GeoJson(
     data=bangkok_geo,
-    style_function=combined_district_style,
-    tooltip=GeoJsonTooltip(fields=tooltip_fields, aliases=tooltip_aliases, localize=True, labels=True, sticky=True),
-    name="Districts Combined"
+    name="District Choropleth",
+    style_function=choro_style,
+    highlight_function=lambda f: {'weight':2.8, 'color':'#000000', 'fillOpacity':0.85},
+    tooltip=GeoJsonTooltip(
+        fields=[district_name_field, 'sum_hospital_weights', 'num_hospitals', 'num_communities'],
+        aliases=['เขต:', 'sum weights:', '# hospitals:', '# communities:'],
+        localize=True
+    ),
+).add_to(choropleth_layer)
+
+# -------------------------
+# District boundaries layer (thicker stroke) - visible by default
+# We capture the GeoJson object reference (gj_bounds) so we can bind handlers directly in JS.
+# -------------------------
+def bounds_style(feature):
+    return {'fillColor': 'transparent', 'color': '#2c3e50', 'weight': 2.8, 'opacity': 0.9}
+
+districts_layer = folium.FeatureGroup(name="Bangkok Districts (bounds)", show=True).add_to(m)
+gj_bounds = folium.GeoJson(
+    data=bangkok_geo,
+    name="Bangkok Districts (bounds)",
+    style_function=bounds_style,
+    highlight_function=lambda f: {'weight':3.6, 'color':'#000000'},
+    tooltip=GeoJsonTooltip(fields=[district_name_field], aliases=['เขต:'])
 ).add_to(districts_layer)
 
 # -------------------------
-# Hospitals markers (popup restored to detailed text info)
+# District popup on click (separate, dedicated popup layer)
+# DEFAULT VISIBLE
 # -------------------------
-hospitals_layer = FeatureGroup(name="Hospitals Only", show=True, control=False).add_to(m)
-ICON_SIZE = (22, 22)
-ICON_ANCHOR = (11, 11)
-for _, row in hospitals.iterrows():
-    try:
-        latf = float(row[lat_col])
-        lonf = float(row[lon_col])
-    except Exception:
-        continue
-    title = row.get('โรงพยาบาล') or row.get(hosp_name_col) or ''
-    title_esc = html.escape(str(title))
-    district_val = row.get('เขต') or row.get('district') or ''
-    tel_val = row.get('tel') or row.get('โทรศัพท์') or ''
-    url_val = row.get('url') or row.get('website') or ''
-
-    # RESTORED popup: textual details (icon in header + text details) instead of icon-only popup
-    popup_html = """
-    <div style="background:#EAF3FF; color:#1A1A1A; font-family: 'Bai Jamjuree', sans-serif; padding:12px; border-radius:8px; border:2px solid #6C7A89;">
-      <div style="display:flex; align-items:center; gap:8px; font-weight:600; font-size:16px;">
-        <img src="{icon}" style="width:16px;height:16px;" alt="h" />
-        <div>{title}</div>
-      </div>
-      <div style="margin-top:8px; font-size:14px;">
-        <div><strong>เขต:</strong> {district}</div>
-        <div><strong>เบอร์:</strong> {tel}</div>
-        <div><strong>เว็บไซต์:</strong> <a href="{url}" target="_blank" rel="noopener noreferrer">{url}</a></div>
-      </div>
-    </div>
-    """.format(icon=HOSP_ICON_URI, title=title_esc, district=html.escape(str(district_val)),
-               tel=html.escape(str(tel_val)), url=html.escape(str(url_val)))
-
-    folium.Marker(location=[latf, lonf],
-                  icon=folium.CustomIcon(HOSP_ICON_URI, ICON_SIZE, ICON_ANCHOR),
-                  popup=folium.Popup(popup_html, max_width=360),
-                  tooltip=title_esc).add_to(hospitals_layer)
+popup_fields = [district_name_field, 'num_hospitals', 'num_communities', 'sum_hospital_weights']
+popup_aliases = ['เขต:', 'จำนวนโรงพยาบาล:', 'จำนวนชุมชน:', 'sum weights:']
+popup = GeoJsonPopup(fields=popup_fields, aliases=popup_aliases, localize=True, labels=True, style="background-color: white;")
+popup_layer = folium.FeatureGroup(name="District Popups (click)", show=True).add_to(m)
+gj_popup = folium.GeoJson(data=bangkok_geo, popup=popup, name="District Popups").add_to(popup_layer)
 
 # -------------------------
-# Simple CSS to ensure font and tooltip size + LayerControl font
+# Click-to-highlight + zoom JS bound directly to gj_bounds var created by folium
+# This is more robust than scanning all layers.
 # -------------------------
-css = """
-<link href="https://fonts.googleapis.com/css2?family=Bai+Jamjuree:wght@400;600&display=swap" rel="stylesheet">
-<style>
-.leaflet-tooltip { font-family: 'Bai Jamjuree', sans-serif !important; font-size: 16px !important; color: #1A1A1A !important; }
-
-/* LayerControl font (ชื่อ map และรายการ) */
-.leaflet-control-layers,
-.leaflet-control-layers .leaflet-control-layers-list,
-.leaflet-control-layers label {
-  font-family: 'Bai Jamjuree', sans-serif !important;
-  font-size: 16px !important;
-  line-height: 1.2 !important;
-}
-
-/* make inputs bigger for touch */
-.leaflet-control-layers input[type="checkbox"],
-.leaflet-control-layers input[type="radio"] {
-  width: 18px;
-  height: 18px;
-  margin-top: 2px;
-}
-
-/* hospital popup base */
-.hospital-popup { background:#EAF3FF; color:#1A1A1A; font-family:'Bai Jamjuree',sans-serif; padding:12px; border-radius:8px; border:2px solid #6C7A89; }
-</style>
-"""
-m.get_root().html.add_child(folium.Element(css))
-
-# -------------------------
-# Inject JS to enable touch behavior: tap to open/close GeoJson tooltips on mobile
-# This makes tooltips usable on touch devices while keeping hover on desktop.
-# -------------------------
-gj_var = gj.get_name()
-map_var = m.get_name()
-js_touch_template = """
+click_highlight_js = """
 <script>
 (function(){
-  try {
-    var isTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints && navigator.maxTouchPoints>0);
-    if (!isTouch) return;
+  var map = %s;
+  var gjVarName = '%s';
+  var gj = window[gjVarName];
+  console.log('click_highlight: gjVarName=', gjVarName, 'gj=', gj);
+  var previous = null;
 
-    var map = {MAP_VAR};
-    var GJ_NAME = '{GJ_VAR}';
-    var openLayer = null;
+  function resetStyle(layer) {
+    try { if (layer.setStyle) layer.setStyle({fillOpacity:0, fillColor:'transparent'}); } catch(e){}
+  }
 
-    function bindTouchBehaviorToGeoJson(gj) {
-      try {
-        if (!gj || !gj.eachLayer) return;
-        gj.eachLayer(function(layer){
-          try {
-            if (layer._touchBound) return;
-            layer.on('click touchstart', function(e){
-              try {
-                // close previously opened tooltip (if different)
-                if (openLayer && openLayer !== this) {
-                  try { openLayer.closeTooltip(); } catch(err){}
-                  openLayer = null;
-                }
-                // toggle this tooltip
-                var already = (openLayer === this);
-                if (already) {
-                  try { this.closeTooltip(); } catch(err){}
-                  openLayer = null;
-                } else {
-                  try { this.openTooltip(e.latlng); } catch(err){}
-                  openLayer = this;
-                }
-              } catch(err){
-                console.warn('touch open tooltip err', err);
-              }
-            });
-            layer._touchBound = true;
-          } catch(e){ console.warn('bind layer err', e); }
-        });
-      } catch(e){ console.warn('bindTouchBehaviorToGeoJson err', e); }
-    }
-
-    function scanAndBind(){
-      try {
-        var gj = window[GJ_NAME];
-        if (gj && gj.eachLayer) bindTouchBehaviorToGeoJson(gj);
-        // Also try to find GeoJSON objects in map layers if nested in FeatureGroups
-        map.eachLayer(function(layer){
-          try {
-            if (layer && layer.eachLayer && layer.options && layer.options.name) {
-              bindTouchBehaviorToGeoJson(layer);
-            }
-          } catch(e){}
-        });
-      } catch(e){ console.warn('scanAndBind err', e); }
-    }
-
-    scanAndBind();
-    var retry = 0;
-    var iv = setInterval(function(){
-      retry++;
-      scanAndBind();
-      if (retry>12) clearInterval(iv);
-    }, 300);
-
-    // close tooltip when tapping map background
+  function bindOnce() {
     try {
-      map.on('click touchstart', function(e){
-        if (openLayer) {
-          try { openLayer.closeTooltip(); } catch(e){}
-          openLayer = null;
+      if (!gj || !gj.eachLayer) return false;
+      gj.eachLayer(function(layer){
+        try {
+          if (layer._hasClickHandler) return;
+          layer.on('click', function(e){
+            if (previous && previous !== layer) {
+              resetStyle(previous);
+              previous = null;
+            }
+            try { layer.setStyle({fillColor: '#2196F3', fillOpacity: 0.35}); previous = layer; } catch(err){}
+            try {
+              if (layer.getBounds) map.fitBounds(layer.getBounds(), {padding: [20,20]});
+              else if (e && e.target && e.target.getBounds) map.fitBounds(e.target.getBounds(), {padding: [20,20]});
+              // bring to front if available
+              try { if (layer.bringToFront) layer.bringToFront(); } catch(e){}
+            } catch(err){}
+          });
+          layer._hasClickHandler = true;
+        } catch(err){
+          console.warn('bindOnce: layer bind error', err);
         }
       });
-    } catch(e){}
-  } catch(e){ console.warn('touch support init error', e); }
+      return true;
+    } catch(e){
+      console.warn('bindOnce: exception', e);
+      return false;
+    }
+  }
+
+  // Try binding now; retry if needed
+  var attempts = 0;
+  var maxAttempts = 40;
+  var intervalMs = 300;
+  var interval = setInterval(function(){
+    attempts += 1;
+    try {
+      var ok = bindOnce();
+      if (ok || attempts >= maxAttempts) {
+        clearInterval(interval);
+        console.log('click_highlight: bindOnce completed, ok=', ok, 'attempts=', attempts);
+      }
+    } catch(e){
+      console.warn('click_highlight: attempt error', e);
+    }
+  }, intervalMs);
+
 })();
 </script>
-"""
-js_touch = (js_touch_template
-            .replace("{MAP_VAR}", map_var)
-            .replace("{GJ_VAR}", gj_var))
-m.get_root().html.add_child(folium.Element(js_touch))
+""" % (m.get_name(), gj_bounds.get_name())
+
+m.get_root().html.add_child(folium.Element(click_highlight_js))
 
 # -------------------------
-# LayerControl (base layers only) and save
+# Layer Control and Save
 # -------------------------
 folium.LayerControl(collapsed=False).add_to(m)
 m.save(OUT_HTML)
-print("Saved:", OUT_HTML)
-print("- Combined 'Districts (fill + bounds)' with stroke color #2c3e50.")
-print("- Hospital popups restored to show textual details.")
-print("- Tile names changed to Thai and LayerControl font set to Bai Jamjuree 16px.")
-print("- Mobile touch support injected for GeoJson tooltips (tap to open/close).")
+print(f"Map saved as {OUT_HTML}")
