@@ -254,8 +254,8 @@ def mix_colors(hex1, hex2, t):
     b = b1 + (b2 - b1) * t
     return rgb_to_hex((r, g, b))
 
-small_color_hex = '#ffdede'
-large_color_hex = '#b71c1c'
+small_color_hex = "#deffe5"
+large_color_hex = "#089c57"
 min_radius = 6
 max_radius = 36
 max_beds = hospitals[beds_col].max() if len(hospitals) > 0 else 0
@@ -321,7 +321,7 @@ for _, row in hospitals.iterrows():
         folium.CircleMarker(
             location=[latf, lonf],
             radius=7,
-            color='#d32f2f', fill=True, fill_color='#d32f2f', fill_opacity=1.0,
+            color='#089c57', fill=True, fill_color='#089c57', fill_opacity=1.0,
             weight=0.6,
             tooltip=f"{title} (center)"
         ).add_to(beds_layer)

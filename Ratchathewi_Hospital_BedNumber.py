@@ -282,8 +282,8 @@ district_gj = folium.GeoJson(
 ).add_to(districts_fg)
 
 # --- Beds-based markers (use global max beds for normalization) ---
-small_color_hex = '#ffdede'
-large_color_hex = '#b71c1c'
+small_color_hex = '#deffe5'
+large_color_hex = '#089c57'
 min_radius = 6
 max_radius = 36
 max_beds_global = hospitals[beds_col].max() if len(hospitals)>0 else 0
@@ -343,7 +343,7 @@ for h_idx, hosp in hospitals_in:
         icon = folium.CustomIcon(HOSP_ICON_URI, ICON_SIZE, ICON_ANCHOR)
         folium.Marker(location=[latf, lonf], icon=icon, tooltip=title_esc).add_to(beds_layer)
     except Exception:
-        folium.CircleMarker(location=[latf, lonf], radius=7, color='#d32f2f', fill=True, fill_color='#d32f2f', fill_opacity=1.0, weight=0.6).add_to(beds_layer)
+        folium.CircleMarker(location=[latf, lonf], radius=7, color='#089c57', fill=True, fill_color='#089c57', fill_opacity=1.0, weight=0.6).add_to(beds_layer)
 
 # --- Optional: connections from communities_in to hospitals (only when assigned hospital is inside district) ---
 conn_layer = FeatureGroup(name="Connections (community → hospital)", show=False, control=False).add_to(m)
